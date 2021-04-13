@@ -34,6 +34,17 @@ you have to implement the wrapper/harness (AFL\test_XXX\) depends on target
 
 and add anything you want, such page heap, etc
 
+## F and L options are for powerscheule and mopt mutators respectivly. 
+## MOpt mutators from: https://github.com/puppet-meteor/MOpt-AFL
+## AFLFast powerschedulers from: https://github.com/mboehme/aflfast
+##
+
+Please refer to the original AFL documentation for more info on these flags.
+
+To see the supported instrumentation flags, please refer to the documentation
+on the specific instrumentation mode you are interested in.
+
+
 **instrument JetDB for fuzzing**
 
 ```
