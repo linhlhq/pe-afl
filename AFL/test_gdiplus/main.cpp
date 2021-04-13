@@ -59,7 +59,7 @@ INT main(INT argc, CHAR* argv[])
 	if (argc != 2) PFATAL("test_gdiplus.exe [.emf|.bmp]");
 
 	wchar_t * wcstring = charToWChar(argv[1]);
-	
+	//process_bmp(wcstring);
 
 	while (PERSISTENT_COUNT--) {
 		PRE();

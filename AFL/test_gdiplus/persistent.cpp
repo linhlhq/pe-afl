@@ -143,6 +143,7 @@ LONG WINAPI log_exception(LPEXCEPTION_POINTERS exceptionInfo)
 }
 
 void INIT() {
+	//LoadLibraryA("GdiPlus.dll");
 	target = getenv("AFL_TARGET");
 	if (!target) {
 		PFATAL("Can not getenv AFL_TARGET\n");

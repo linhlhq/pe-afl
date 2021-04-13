@@ -84,10 +84,19 @@ cases that show variable behavior): */
 of 32-bit int overflows): */
 
 #define HAVOC_MAX_MULT      16
-
+#define HAVOC_MAX_MULT_MOPT 32
 /* Absolute minimum number of havoc cycles (after all adjustments): */
 
 #define HAVOC_MIN           16
+
+/* Power Schedule Divisor */
+#define POWER_BETA          1
+#define MAX_FACTOR          (POWER_BETA * 32)
+
+/*Mopt options*/
+#define operator_num 18
+#define swarm_num 5
+#define period_core  500000
 
 /* Maximum stacking for havoc-stage tweaks. The actual value is calculated
 like this:
@@ -107,6 +116,10 @@ two cycles where smaller blocks are favored: */
 #define HAVOC_BLK_SMALL     32
 #define HAVOC_BLK_MEDIUM    128
 #define HAVOC_BLK_LARGE     1500
+
+/* Extra-large blocks, selected very rarely (<5% of the time): */
+
+#define HAVOC_BLK_XL        32768
 
 /* Probabilities of skipping non-favored entries in the queue, expressed as
 percentages: */
