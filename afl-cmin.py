@@ -43,7 +43,8 @@ class AFLShowMapWorker(object):
         else:
             r.extend(['-m', 'none'])
 
-        r.extend(['-p', args.target_module])
+        for mod in args.target_modules:
+            r.extend(['-p', mod])
 
         if args.edges_only:
             r.append('-e')
@@ -85,6 +86,7 @@ class AFLShowMapWorker(object):
         if os.path.isfile(trace_name):
             os.remove(trace_name)
 
+        #print(opts)
         p = subprocess.Popen(opts, stdin=stdin, stdout=nul, stderr=nul)
         p.wait()
 
@@ -154,7 +156,7 @@ def setup_argparse():
 
     group = parser.add_argument_group('instrumentation settings')
     group.add_argument(
-        '-p', '--target_module', required = True,
+        '-p', '--target_modules', required = True, action = 'append',
         metavar = 'module', help = 'module which contains the target function to be fuzzed'
     )
 
@@ -185,6 +187,10 @@ def setup_argparse():
     group.add_argument(
         '-w', '--workers', type = int, default = 1,#multiprocessing.cpu_count(),
         metavar = 'n', help = 'The number of worker processes (default: cpu count)'
+    )
+    group.add_argument(
+        '--skip-dry-run', action = 'store_true', default = False,
+        help = 'Skip the dry-run step even if it failed'
     )
     parser.add_argument(
         'target_cmdline', nargs = argparse.REMAINDER,
@@ -267,7 +273,8 @@ def main(argc, argv):
             '  Tuples non-empty? %r',
             results[0].tuples != {}
         )
-        return 1
+        if not args.skip_dry_run:
+            return 1
 
     logging.info('[+] OK, %d tuples recorded.', len(results[0].tuples))
 
