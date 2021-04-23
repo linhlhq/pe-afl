@@ -48,30 +48,31 @@ there is a problem executing it; or 0 if execution is successful.
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <vector>
 
 static HANDLE child_handle, hnul;
-static char *client_params;
-char *target_module;
+static char* client_params;
+std::vector<char*> target_module;
 
 static CRITICAL_SECTION critical_section;
 static u64 watchdog_timeout_time;
 static u8 watchdog_enabled;
-static u8 *target_cmd;                /* command line of target           */
+static u8* target_cmd;                /* command line of target           */
 
 static HANDLE shm_handle;             /* Handle of the SHM region         */
 static HANDLE pipe_handle;            /* Handle of the name pipe          */
 static u64    name_seed;              /* Random integer to have a unique shm/pipe name */
-static char   *fuzzer_id = NULL;      /* The fuzzer ID or a randomized
+static char* fuzzer_id = NULL;      /* The fuzzer ID or a randomized
 										 seed allowing multiple instances */
 
 static s32 child_pid;                 /* PID of the tested program         */
 
 static u8* trace_bits;                /* SHM with instrumentation bitmap   */
 
-static u8 *out_file,                  /* Trace output file                 */
-*doc_path,                  /* Path to docs                      */
-*target_path,               /* Path to target binary             */
-*at_file;                   /* Substitution string for @@        */
+static u8* out_file,                  /* Trace output file                 */
+* doc_path,                  /* Path to docs                      */
+* target_path,               /* Path to target binary             */
+* at_file;                   /* Substitution string for @@        */
 
 static u32 exec_tmout;                /* Exec timeout (ms)                 */
 
@@ -189,10 +190,10 @@ static void setup_shm(void) {
 			rand_s(&seeds[0]);
 			rand_s(&seeds[1]);
 			name_seed = ((u64)seeds[0] << 32) | seeds[1];
-			fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
+			fuzzer_id = (char*)alloc_printf("%I64x", name_seed);
 		}
 
-		shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
+		shm_str = (char*)alloc_printf("afl_shm_%s", fuzzer_id);
 
 		shm_handle = CreateFileMapping(
 			INVALID_HANDLE_VALUE,    // use paging file
@@ -200,7 +201,7 @@ static void setup_shm(void) {
 			PAGE_READWRITE,          // read/write access
 			0,                       // maximum object size (high-order DWORD)
 			MAP_SIZE,                // maximum object size (low-order DWORD)
-			(char *)shm_str);        // name of mapping object
+			(char*)shm_str);        // name of mapping object
 
 		if (shm_handle == NULL) {
 			if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -230,13 +231,13 @@ static void setup_shm(void) {
 
 	ck_free(shm_str);
 
-	trace_bits = (u8 *)MapViewOfFile(
+	trace_bits = (u8*)MapViewOfFile(
 		shm_handle,          // handle to map object
 		FILE_MAP_ALL_ACCESS, // read/write permission
 		0,
 		0,
 		MAP_SIZE
-		);
+	);
 
 	if (!trace_bits) PFATAL("MapViewOfFile() failed");
 
@@ -282,7 +283,8 @@ static u32 write_results(void) {
 
 		_close(fd);
 
-	} else {
+	}
+	else {
 
 		f = _fdopen(fd, "w");
 
@@ -315,10 +317,10 @@ static u32 write_results(void) {
 
 
 //quoting on Windows is weird
-size_t argv_quote(char *in, char *out) {
+size_t argv_quote(char* in, char* out) {
 	int needs_quoting = 0;
 	size_t size = 0;
-	char *p = in;
+	char* p = in;
 	size_t i;
 
 	//check if quoting is necessary
@@ -377,9 +379,9 @@ size_t argv_quote(char *in, char *out) {
 }
 
 
-char *argv_to_cmd(char** argv) {
+char* argv_to_cmd(char** argv) {
 	u32 len = 0, i;
-	u8* buf, *ret;
+	u8* buf, * ret;
 
 	//todo shell-escape
 
@@ -406,11 +408,11 @@ char *argv_to_cmd(char** argv) {
 
 
 static void create_target_process(char** argv) {
-	char *pipe_name;
+	char* pipe_name;
 	STARTUPINFO si;
 	PROCESS_INFORMATION pi;
 
-	pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
+	pipe_name = (char*)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
 
 	pipe_handle = CreateNamedPipe(
 		pipe_name,				// pipe name
@@ -436,7 +438,8 @@ static void create_target_process(char** argv) {
 	if (quiet_mode) {
 		si.hStdOutput = hnul;
 		si.hStdError = hnul;
-	} else{
+	}
+	else {
 		si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
 		si.hStdError = GetStdHandle(STD_ERROR_HANDLE);;
 	}
@@ -611,6 +614,25 @@ void setup_nul_device() {
 	}
 }
 
+/* Put all target to env*/
+
+static void setup_env_target(std::vector<char*> module)
+{
+	u8* tmp;
+	tmp = (u8*)malloc(1024);
+	memset(tmp, 0, 1024);
+
+	for (int i = 0; i < module.size(); i++) {
+		sprintf(tmp + strlen(tmp), "%s ", module[i]);
+	}
+	tmp[strlen(tmp) - 1] = 0;
+	_putenv_s(TARGET_VAR, tmp);
+
+	if (tmp) {
+		free(tmp);
+	}
+}
+
 /* Detect @@ in args. */
 
 static void detect_file_args(char** argv) {
@@ -626,7 +648,7 @@ static void detect_file_args(char** argv) {
 
 		if (aa_loc) {
 
-			u8 *aa_subst, *n_arg;
+			u8* aa_subst, * n_arg;
 
 			if (!at_file) FATAL("@@ syntax is not supported by this tool.");
 
@@ -707,10 +729,10 @@ static void find_binary(u8* fname) {
 }
 
 static unsigned int optind;
-static char *optarg;
+static char* optarg;
 
-int getopt(int argc, char **argv, char *optstring) {
-	char *c;
+int getopt(int argc, char** argv, char* optstring) {
+	char* c;
 
 	optarg = NULL;
 
@@ -840,7 +862,7 @@ int main(int argc, char** argv) {
 
 		}
 
-				  break;
+				break;
 
 		case 't':
 
@@ -865,9 +887,9 @@ int main(int argc, char** argv) {
 
 		case 'p': /* instrumented PE path */
 
-			if (target_module) FATAL("TODO: Multiple PE support");
-			target_module = optarg;
-			_putenv_s(TARGET_VAR, target_module);
+			//if (target_module) FATAL("TODO: Multiple PE support");
+			target_module.push_back(optarg);
+
 			break;
 
 		case 'd': /* dump execution trace */
@@ -911,9 +933,12 @@ int main(int argc, char** argv) {
 
 			usage(argv[0]);
 
-	}
+		}
 
-	if (optind == argc || !out_file || !target_module) usage(argv[0]);
+	if (optind == argc || !out_file || !target_module.size()) usage(argv[0]);
+
+	// push target to env
+	setup_env_target(target_module);
 
 	extract_client_params(argc, argv);
 

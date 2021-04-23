@@ -27,6 +27,7 @@ how they affect the execution path.
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_RAND_S
 #include <windows.h>
+#include <tlhelp32.h>
 #include <io.h>
 #include <direct.h>
 #include <pdh.h>
@@ -49,7 +50,7 @@ how they affect the execution path.
 
 #include <sys/stat.h>
 #include <sys/types.h>
-
+#include <vector>
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -143,28 +144,28 @@ u64 size_of_header;
 
 static HANDLE shm_handle;             /* Handle of the SHM region         */
 static HANDLE pipe_handle;            /* Handle of the name pipe          */
-static char   *fuzzer_id = NULL;      /* The fuzzer ID or a randomized
+static char* fuzzer_id = NULL;      /* The fuzzer ID or a randomized
 									  seed allowing multiple instances */
 
-char *target_module;
-HANDLE child_handle, hnul;
+std::vector<char*> target_module;
+HANDLE child_handle, hnul, child_thread_handle;
 CRITICAL_SECTION critical_section;
 u64 watchdog_timeout_time;
 u8 watchdog_enabled;
 PDH_HQUERY cpuQuery;
 PDH_HCOUNTER cpuTotal;
 
-EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
-*out_file,                  /* File to fuzz, if any             */
-*out_dir,                   /* Working & output directory       */
-*sync_dir,                  /* Synchronization directory        */
-*sync_id,                   /* Fuzzer ID                        */
-*use_banner,                /* Display banner                   */
-*in_bitmap,                 /* Input bitmap                     */
-*doc_path,                  /* Path to documentation dir        */
-*target_path,               /* Path to target binary            */
-*target_cmd,                /* command line of target           */
-*orig_cmdline;              /* Original command line            */
+EXP_ST u8* in_dir,                    /* Input directory with test cases  */
+* out_file,                  /* File to fuzz, if any             */
+* out_dir,                   /* Working & output directory       */
+* sync_dir,                  /* Synchronization directory        */
+* sync_id,                   /* Fuzzer ID                        */
+* use_banner,                /* Display banner                   */
+* in_bitmap,                 /* Input bitmap                     */
+* doc_path,                  /* Path to documentation dir        */
+* target_path,               /* Path to target binary            */
+* target_cmd,                /* command line of target           */
+* orig_cmdline;              /* Original command line            */
 
 EXP_ST u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
 EXP_ST u64 mem_limit = MEM_LIMIT;     /* Memory cap for child (MB)        */
@@ -268,9 +269,9 @@ u32 havoc_max_mult;
 
 static u32 subseq_hangs;              /* Number of hangs in a row         */
 
-static u8 *stage_name = "init",       /* Name of the current fuzz stage   */
-*stage_short,               /* Short stage name                 */
-*syncing_party;             /* Currently syncing with...        */
+static u8* stage_name = "init",       /* Name of the current fuzz stage   */
+* stage_short,               /* Short stage name                 */
+* syncing_party;             /* Currently syncing with...        */
 
 static s32 stage_cur, stage_max;      /* Stage progression                */
 static s32 splicing_with = -1;        /* Splicing with which test case?   */
@@ -297,11 +298,7 @@ total_bitmap_entries;      /* Number of bitmaps counted        */
 
 static u32 cpu_core_count;            /* CPU core count                   */
 
-#ifdef HAVE_AFFINITY
-
-static s32 cpu_aff = -1;       	      /* Selected CPU core                */
-
-#endif /* HAVE_AFFINITY */
+static u64 cpu_aff = 0;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
@@ -331,15 +328,15 @@ struct queue_entry {
 	u8* trace_mini;                     /* Trace bytes, if kept             */
 	u32 tc_ref;                         /* Trace bytes ref count            */
 
-	struct queue_entry *next,           /* Next element, if any             */
-		*next_100;       /* 100 elements ahead               */
+	struct queue_entry* next,           /* Next element, if any             */
+		* next_100;       /* 100 elements ahead               */
 
 };
 
-static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
-*queue_cur, /* Current offset within the queue  */
-*queue_top, /* Top of the list                  */
-*q_prev100; /* Previous 100 marker              */
+static struct queue_entry* queue,     /* Fuzzing queue (linked list)      */
+* queue_cur, /* Current offset within the queue  */
+* queue_top, /* Top of the list                  */
+* q_prev100; /* Previous 100 marker              */
 
 static struct queue_entry*
 top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
@@ -514,7 +511,7 @@ static void shuffle_ptrs(void** ptrs, u32 cnt) {
 	for (i = 0; i < cnt - 2; i++) {
 
 		u32 j = i + UR(cnt - i);
-		void *s = ptrs[i];
+		void* s = ptrs[i];
 		ptrs[i] = ptrs[j];
 		ptrs[j] = s;
 
@@ -522,20 +519,65 @@ static void shuffle_ptrs(void** ptrs, u32 cnt) {
 
 }
 
+static u64 get_process_affinity(u32 process_id) {
 
-#ifdef HAVE_AFFINITY
+	/* if we can't get process affinity we treat it as if he doesn't have affinity */
+	u64 affinity = 0;
+	DWORD_PTR process_affinity_mask = 0;
+	DWORD_PTR system_affinity_mask = 0;
+
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+	if (process == NULL) {
+		return affinity;
+	}
+
+	if (GetProcessAffinityMask(process, &process_affinity_mask, &system_affinity_mask)) {
+		affinity = (u64)process_affinity_mask;
+	}
+
+	CloseHandle(process);
+
+	return affinity;
+}
+
+static u32 count_mask_bits(u64 mask) {
+
+	u32 count = 0;
+
+	while (mask) {
+		if (mask & 1) {
+			count++;
+		}
+		mask >>= 1;
+	}
+
+	return count;
+}
+
+static u32 get_bit_idx(u64 mask) {
+
+	u32 i;
+
+	for (i = 0; i < 64; i++) {
+		if (mask & (1ULL << i)) {
+			return i;
+		}
+	}
+
+	return 0;
+}
 
 /* Build a list of processes bound to specific cores. Returns -1 if nothing
 can be found. Assumes an upper bound of 4k CPUs. */
 
 static void bind_to_free_cpu(void) {
 
-	DIR* d;
-	struct dirent* de;
-	cpu_set_t c;
+	u8 cpu_used[64];
+	u32 i = 0;
+	PROCESSENTRY32 process_entry;
+	HANDLE process_snap = INVALID_HANDLE_VALUE;
 
-	u8 cpu_used[4096] = { 0 };
-	u32 i;
+	memset(cpu_used, 0, sizeof(cpu_used));
 
 	if (cpu_core_count < 2) return;
 
@@ -543,101 +585,83 @@ static void bind_to_free_cpu(void) {
 
 		WARNF("Not binding to a CPU core (AFL_NO_AFFINITY set).");
 		return;
-
 	}
 
-	d = opendir("/proc");
-
-	if (!d) {
-
-		WARNF("Unable to access /proc - can't scan for free CPU cores.");
-		return;
-
-	}
-
-	ACTF("Checking CPU core loadout...");
-
-	/* Introduce some jitter, in case multiple AFL tasks are doing the same
-	thing at the same time... */
-
-	usleep(R(1000) * 250);
-
-	/* Scan all /proc/<pid>/status entries, checking for Cpus_allowed_list.
-	Flag all processes bound to a specific CPU using cpu_used[]. This will
-	fail for some exotic binding setups, but is likely good enough in almost
-	all real-world use cases. */
-
-	while ((de = readdir(d))) {
-
-		u8* fn;
-		FILE* f;
-		u8 tmp[MAX_LINE];
-		u8 has_vmsize = 0;
-
-		if (!isdigit(de->d_name[0])) continue;
-
-		fn = alloc_printf("/proc/%s/status", de->d_name);
-
-		if (!(f = f_open(fn, "r"))) {
-			ck_free(fn);
-			continue;
-		}
-
-		while (fgets(tmp, MAX_LINE, f)) {
-
-			u32 hval;
-
-			/* Processes without VmSize are probably kernel tasks. */
-
-			if (!strncmp(tmp, "VmSize:\t", 8)) has_vmsize = 1;
-
-			if (!strncmp(tmp, "Cpus_allowed_list:\t", 19) &&
-				!strchr(tmp, '-') && !strchr(tmp, ',') &&
-				sscanf(tmp + 19, "%u", &hval) == 1 && hval < sizeof(cpu_used) &&
-				has_vmsize) {
-
-				cpu_used[hval] = 1;
-				break;
-
-			}
-
-		}
-
-		ck_free(fn);
-		f_close(f);
-
-	}
-
-	closedir(d);
-
-	for (i = 0; i < cpu_core_count; i++) if (!cpu_used[i]) break;
-
-	if (i == cpu_core_count) {
-
+	/* Currently winafl doesn't support more than 64 cores */
+	if (cpu_core_count > 64) {
 		SAYF("\n" cLRD "[-] " cRST
-			"Uh-oh, looks like all %u CPU cores on your system are allocated to\n"
-			"    other instances of afl-fuzz (or similar CPU-locked tasks). Starting\n"
-			"    another fuzzer on this machine is probably a bad plan, but if you are\n"
-			"    absolutely sure, you can set AFL_NO_AFFINITY and try again.\n",
+			"Uh-oh, looks like you have %u CPU cores on your system\n"
+			"    winafl doesn't support more than 64 cores at the moment\n"
+			"    you can set AFL_NO_AFFINITY and try again.\n",
 			cpu_core_count);
-
-		FATAL("No more free CPU cores");
-
+		FATAL("Too many cpus for automatic binding");
 	}
 
-	OKF("Found a free CPU core, binding to #%u.", i);
+	if (!cpu_aff) {
+		ACTF("Checking CPU core loadout...");
 
-	cpu_aff = i;
+		/* Introduce some jitter, in case multiple AFL tasks are doing the same
+		thing at the same time... */
 
-	CPU_ZERO(&c);
-	CPU_SET(i, &c);
+		srand(GetTickCount() + GetCurrentProcessId());
+		Sleep(R(1000) * 3);
 
-	if (sched_setaffinity(0, sizeof(c), &c))
-		PFATAL("sched_setaffinity failed");
+		process_snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		if (process_snap == INVALID_HANDLE_VALUE) {
+			FATAL("Failed to create snapshot");
+		}
+
+		process_entry.dwSize = sizeof(PROCESSENTRY32);
+		if (!Process32First(process_snap, &process_entry)) {
+			CloseHandle(process_snap);
+			FATAL("Failed to enumerate processes");
+		}
+
+		do {
+			unsigned long cpu_idx = 0;
+			u64 affinity = get_process_affinity(process_entry.th32ProcessID);
+
+			if ((affinity == 0) || (count_mask_bits(affinity) > 1)) continue;
+
+			cpu_idx = get_bit_idx(affinity);
+			cpu_used[cpu_idx] = 1;
+		} while (Process32Next(process_snap, &process_entry));
+
+		CloseHandle(process_snap);
+
+		/* If the user only uses subset of the core, prefer non-sequential cores
+		   to avoid pinning two hyper threads of the same core */
+		for (i = 0; i < cpu_core_count; i += 2) if (!cpu_used[i]) break;
+
+		/* Fallback to the sequential scan */
+		if (i >= cpu_core_count) {
+			for (i = 0; i < cpu_core_count; i++) if (!cpu_used[i]) break;
+		}
+
+		if (i == cpu_core_count) {
+			SAYF("\n" cLRD "[-] " cRST
+				"Uh-oh, looks like all %u CPU cores on your system are allocated to\n"
+				"    other instances of afl-fuzz (or similar CPU-locked tasks). Starting\n"
+				"    another fuzzer on this machine is probably a bad plan, but if you are\n"
+				"    absolutely sure, you can set AFL_NO_AFFINITY and try again.\n",
+				cpu_core_count);
+
+			FATAL("No more free CPU cores");
+
+		}
+
+		OKF("Found a free CPU core, binding to #%u.", i);
+
+		cpu_aff = 1ULL << i;
+	}
+
+	if (!SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)cpu_aff)) {
+		FATAL("Failed to set process affinity");
+	}
+
+	OKF("Process affinity is set to %I64x.\n", cpu_aff);
 
 }
-
-#endif /* HAVE_AFFINITY */
 
 #ifndef IGNORE_FINDS
 
@@ -851,7 +875,7 @@ the files. */
 
 static void mark_as_variable(struct queue_entry* q) {
 
-	u8 *fn = strrchr(q->fname, '\\') + 1, *ldest;
+	u8* fn = strrchr(q->fname, '\\') + 1, * ldest;
 
 	ldest = alloc_printf("..\\..\\%s", fn);
 	fn = alloc_printf("%s\\queue\\.state\\variable_behavior\\%s", out_dir, fn);
@@ -941,7 +965,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
 EXP_ST void destroy_queue(void) {
 
-	struct queue_entry *q = queue, *n;
+	struct queue_entry* q = queue, * n;
 
 	while (q) {
 
@@ -1552,11 +1576,11 @@ EXP_ST void setup_shm(void) {
 			rand_s(&seeds[0]);
 			rand_s(&seeds[1]);
 			name_seed = ((u64)seeds[0] << 32) | seeds[1];
-			fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
+			fuzzer_id = (char*)alloc_printf("%I64x", name_seed);
 
 		}
 
-		shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
+		shm_str = (char*)alloc_printf("afl_shm_%s", fuzzer_id);
 
 		shm_handle = CreateFileMapping(
 			INVALID_HANDLE_VALUE,    // use paging file
@@ -1564,7 +1588,7 @@ EXP_ST void setup_shm(void) {
 			PAGE_READWRITE,          // read/write access
 			0,                       // maximum object size (high-order DWORD)
 			MAP_SIZE,                // maximum object size (low-order DWORD)
-			(char *)shm_str);        // name of mapping object
+			(char*)shm_str);        // name of mapping object
 
 		if (shm_handle == NULL) {
 			if (sync_id) {
@@ -1594,13 +1618,13 @@ EXP_ST void setup_shm(void) {
 
 	ck_free(shm_str);
 
-	trace_bits = (u8 *)MapViewOfFile(
+	trace_bits = (u8*)MapViewOfFile(
 		shm_handle,          // handle to map object
 		FILE_MAP_ALL_ACCESS, // read/write permission
 		0,
 		0,
 		MAP_SIZE
-		);
+	);
 
 	if (!trace_bits) PFATAL("shmat() failed");
 
@@ -1613,15 +1637,15 @@ static void setup_post(void) {
 	//not implemented on Windows
 }
 
-int compare_filename(const void *a, const void *b) {
-	return strcmp(*((char **)a), *((char **)b));
+int compare_filename(const void* a, const void* b) {
+	return strcmp(*((char**)a), *((char**)b));
 }
 
-int scandir_sorted(char *in_dir, char ***out) {
+int scandir_sorted(char* in_dir, char*** out) {
 	unsigned int cnt = 0, cnt2 = 0;
 	WIN32_FIND_DATA fd;
 	HANDLE h;
-	char *pattern;
+	char* pattern;
 
 	if (in_dir[strlen(in_dir) - 1] == '\\') {
 		pattern = alloc_printf("%s*", in_dir);
@@ -1642,7 +1666,7 @@ int scandir_sorted(char *in_dir, char ***out) {
 
 	FindClose(h);
 
-	*out = (char **)malloc(cnt*sizeof(char *));
+	*out = (char**)malloc(cnt * sizeof(char*));
 
 	h = FindFirstFile(pattern, &fd);
 	if (h == INVALID_HANDLE_VALUE) return -1;
@@ -1652,9 +1676,9 @@ int scandir_sorted(char *in_dir, char ***out) {
 		if (strcmp(fd.cFileName, "README.txt") == 0) continue;
 
 		cnt2++;
-		if (cnt2>cnt) break;
+		if (cnt2 > cnt) break;
 
-		(*out)[cnt2 - 1] = (char *)malloc(strlen(fd.cFileName) + 1);
+		(*out)[cnt2 - 1] = (char*)malloc(strlen(fd.cFileName) + 1);
 		strcpy((*out)[cnt2 - 1], fd.cFileName);
 	} while (FindNextFile(h, &fd));
 
@@ -1662,14 +1686,14 @@ int scandir_sorted(char *in_dir, char ***out) {
 
 	if (cnt2 != cnt) return -1;
 
-	qsort(*out, cnt, sizeof(char *), compare_filename);
+	qsort(*out, cnt, sizeof(char*), compare_filename);
 
 	ck_free(pattern);
 
 	return cnt;
 }
 
-int64_t FileSize(char *name) {
+int64_t FileSize(char* name) {
 	WIN32_FILE_ATTRIBUTE_DATA fad;
 	if (!GetFileAttributesEx(name, GetFileExInfoStandard, &fad))
 		return -1; // error condition, could call GetLastError to find out more
@@ -1681,7 +1705,7 @@ Called at startup. */
 
 static void read_testcases(void) {
 
-	u8 **nl;
+	u8** nl;
 	s32 nl_cnt;
 	s32 i;
 	u8* fn;
@@ -1704,10 +1728,10 @@ static void read_testcases(void) {
 		if (errno == ENOENT || errno == ENOTDIR)
 
 			SAYF("\n" cLRD "[-] " cRST
-			"The input directory does not seem to be valid - try again. The fuzzer needs\n"
-			"    one or more test case to start with - ideally, a small file under 1 kB\n"
-			"    or so. The cases must be stored as regular files directly in the input\n"
-			"    directory.\n");
+				"The input directory does not seem to be valid - try again. The fuzzer needs\n"
+				"    one or more test case to start with - ideally, a small file under 1 kB\n"
+				"    or so. The cases must be stored as regular files directly in the input\n"
+				"    directory.\n");
 
 		PFATAL("Unable to open '%s'", in_dir);
 
@@ -1737,14 +1761,14 @@ static void read_testcases(void) {
 			PFATAL("Unable to access '%s'", fn);
 
 		if (st_size == 0) {
-	      ck_free(fn);
-	      ck_free(dfn);
-	      continue;
-	    }
-	    
+			ck_free(fn);
+			ck_free(dfn);
+			continue;
+		}
+
 		if (st_size > MAX_FILE)
 			FATAL("Test case '%s' is too big (%s, limit is %s)", fn,
-			DMS(st_size), DMS(MAX_FILE));
+				DMS(st_size), DMS(MAX_FILE));
 
 		/* Check for metadata that indicates that deterministic fuzzing
 		is complete for this entry. We don't want to repeat deterministic
@@ -1781,15 +1805,15 @@ static void read_testcases(void) {
 /* Helper function for load_extras. */
 
 static int compare_extras_len(const void* p1, const void* p2) {
-	struct extra_data *e1 = (struct extra_data*)p1,
-		*e2 = (struct extra_data*)p2;
+	struct extra_data* e1 = (struct extra_data*)p1,
+		* e2 = (struct extra_data*)p2;
 
 	return e1->len - e2->len;
 }
 
 static int compare_extras_use_d(const void* p1, const void* p2) {
-	struct extra_data *e1 = (struct extra_data*)p1,
-		*e2 = (struct extra_data*)p2;
+	struct extra_data* e1 = (struct extra_data*)p1,
+		* e2 = (struct extra_data*)p2;
 
 	return e2->hit_cnt - e1->hit_cnt;
 }
@@ -1802,7 +1826,7 @@ static void load_extras_file(u8* fname, u32* min_len, u32* max_len,
 
 	FILE* f;
 	u8  buf[MAX_LINE];
-	u8  *lptr;
+	u8* lptr;
 	u32 cur_line = 0;
 
 	f = fopen(fname, "r");
@@ -1811,7 +1835,7 @@ static void load_extras_file(u8* fname, u32* min_len, u32* max_len,
 
 	while ((lptr = fgets(buf, MAX_LINE, f))) {
 
-		u8 *rptr, *wptr;
+		u8* rptr, * wptr;
 		u32 klen = 0;
 
 		cur_line++;
@@ -1918,7 +1942,7 @@ static void load_extras_file(u8* fname, u32* min_len, u32* max_len,
 
 		if (extras[extras_cnt].len > MAX_DICT_FILE)
 			FATAL("Keyword too big in line %u (%s, limit is %s)", cur_line,
-			DMS(klen), DMS(MAX_DICT_FILE));
+				DMS(klen), DMS(MAX_DICT_FILE));
 
 		if (*min_len > klen) *min_len = klen;
 		if (*max_len < klen) *max_len = klen;
@@ -1982,7 +2006,7 @@ static void load_extras(u8* dir) {
 
 		if ((fdata.nFileSizeHigh > 0) || (fdata.nFileSizeLow > MAX_DICT_FILE))
 			FATAL("Extra '%s' is too big (%s, limit is %s)", fn,
-			DMS(fdata.nFileSizeLow), DMS(MAX_DICT_FILE));
+				DMS(fdata.nFileSizeLow), DMS(MAX_DICT_FILE));
 
 		if (min_len > fdata.nFileSizeLow) min_len = fdata.nFileSizeLow;
 		if (max_len < fdata.nFileSizeLow) max_len = fdata.nFileSizeLow;
@@ -2020,11 +2044,11 @@ check_and_sort:
 
 	if (max_len > 32)
 		WARNF("Some tokens are relatively large (%s) - consider trimming.",
-		DMS(max_len));
+			DMS(max_len));
 
 	if (extras_cnt > MAX_DET_EXTRAS)
 		WARNF("More than %u tokens - will use them probabilistically.",
-		MAX_DET_EXTRAS);
+			MAX_DET_EXTRAS);
 
 }
 
@@ -2112,7 +2136,7 @@ static void maybe_add_auto(u8* mem, u32 len) {
 
 	if (a_extras_cnt < MAX_AUTO_EXTRAS) {
 
-		a_extras = (struct extra_data *)ck_realloc_block((u8*)a_extras, (a_extras_cnt + 1) *
+		a_extras = (struct extra_data*)ck_realloc_block((u8*)a_extras, (a_extras_cnt + 1) *
 			sizeof(struct extra_data));
 
 		a_extras[a_extras_cnt].data = (u8*)ck_memdup(mem, len);
@@ -2251,10 +2275,10 @@ EXP_ST void init_forkserver(char** argv) {
 }
 
 //quoting on Windows is weird
-size_t argv_quote(char *in, char *out) {
+size_t argv_quote(char* in, char* out) {
 	int needs_quoting = 0;
 	size_t size = 0;
-	char *p = in;
+	char* p = in;
 	size_t i;
 
 	//check if quoting is necessary
@@ -2312,9 +2336,9 @@ size_t argv_quote(char *in, char *out) {
 	return size;
 }
 
-char *argv_to_cmd(char** argv) {
+char* argv_to_cmd(char** argv) {
 	u32 len = 0, i;
-	u8* buf, *ret;
+	u8* buf, * ret;
 
 	//todo shell-escape
 
@@ -2345,15 +2369,18 @@ char *argv_to_cmd(char** argv) {
 
 static int is_child_running();
 static void create_target_process(char** argv) {
-	char *pipe_name;
+	char* pipe_name;
+
+	HANDLE hJob = NULL;
+	JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limit;
 	STARTUPINFO si;
 	PROCESS_INFORMATION pi;
 
-	pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
+	pipe_name = (char*)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
 
 	EnterCriticalSection(&critical_section);
 
-	if (pipe_handle){
+	if (pipe_handle) {
 		DisconnectNamedPipe(pipe_handle);
 		CloseHandle(pipe_handle);
 		pipe_handle = NULL;
@@ -2394,11 +2421,47 @@ static void create_target_process(char** argv) {
 	}
 	ZeroMemory(&pi, sizeof(pi));
 
-	if (!CreateProcess(NULL, target_cmd, NULL, NULL, TRUE, /*CREATE_NO_WINDOW*/0, NULL, NULL, &si, &pi)) {
+	if (mem_limit || cpu_aff) {
+		hJob = CreateJobObject(NULL, NULL);
+		if (hJob == NULL) {
+			FATAL("CreateJobObject failed, GLE=%d.\n", GetLastError());
+		}
+
+		ZeroMemory(&job_limit, sizeof(job_limit));
+		if (mem_limit) {
+			job_limit.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+			job_limit.ProcessMemoryLimit = mem_limit * 1024 * 1024;
+		}
+
+		if (cpu_aff) {
+			job_limit.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY;
+			job_limit.BasicLimitInformation.Affinity = (DWORD_PTR)cpu_aff;
+		}
+
+		if (!SetInformationJobObject(
+			hJob,
+			JobObjectExtendedLimitInformation,
+			&job_limit,
+			sizeof(job_limit)
+		)) {
+			FATAL("SetInformationJobObject failed, GLE=%d.\n", GetLastError());
+		}
+	}
+
+	if (!CreateProcess(NULL, target_cmd, NULL, NULL, TRUE, /*CREATE_NO_WINDOW*/CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
 		FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
 	}
 
 	child_handle = pi.hProcess;
+	child_thread_handle = pi.hThread;
+
+	if (mem_limit || cpu_aff) {
+		if (!AssignProcessToJobObject(hJob, child_handle)) {
+			FATAL("AssignProcessToJobObject failed, GLE=%d.\n", GetLastError());
+		}
+	}
+
+	ResumeThread(child_thread_handle);
 
 	watchdog_timeout_time = get_cur_time() + exec_tmout;
 	watchdog_enabled = 1;
@@ -2428,7 +2491,10 @@ static void SafeTerminateProcess() {
 		}
 
 		CloseHandle(child_handle);
+		CloseHandle(child_thread_handle);
+
 		child_handle = NULL;
+		child_thread_handle = NULL;
 
 	}
 
@@ -2461,7 +2527,13 @@ static void setup_watchdog_timer() {
 }
 
 static int is_child_running() {
-	return (child_handle && (WaitForSingleObject(child_handle, 0) == WAIT_TIMEOUT));
+	int ret;
+
+	EnterCriticalSection(&critical_section);
+	ret = (child_handle && (WaitForSingleObject(child_handle, 0) == WAIT_TIMEOUT));
+	LeaveCriticalSection(&critical_section);
+
+	return ret;
 }
 
 /* Execute target application, monitoring for timeouts. Return status
@@ -2659,12 +2731,13 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
 	if (!from_queue || resuming_fuzz)
 		old_tmout = MAX(exec_tmout + CAL_TMOUT_ADD,
-		exec_tmout * CAL_TMOUT_PERC / 100);
+			exec_tmout * CAL_TMOUT_PERC / 100);
 
 	q->cal_failed++;
 
 	stage_name = "calibration";
 	stage_max = CAL_CYCLES;
+	stage_max = 3;
 
 	/* Make sure the forkserver is up before we do anything, and let's not
 	count its spin-up time toward binary calibration. */
@@ -2697,7 +2770,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 		}
 
 		cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
-		
+
 		if (q->exec_cksum != cksum) {
 
 			u8 hnb = has_new_bits(virgin_bits);
@@ -2713,11 +2786,12 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
 						var_bytes[i] = 1;
 						stage_max = CAL_CYCLES_LONG;
+						stage_max = 8;
 
 					}
 
 				}
-				
+
 				var_detected = 1;
 
 			}
@@ -2840,7 +2914,7 @@ static void perform_dry_run(char** argv) {
 
 		if (res == crash_mode || res == FAULT_NOBITS)
 			SAYF(cGRA "    len = %u, map size = %u, exec speed = %llu us\n" cRST,
-			q->len, q->bitmap_size, q->exec_us);
+				q->len, q->bitmap_size, q->exec_us);
 
 		switch (res) {
 
@@ -2975,7 +3049,7 @@ static void perform_dry_run(char** argv) {
 
 		if (cal_failures == queued_paths)
 			FATAL("All test cases time out%s, giving up!",
-			skip_crashes ? " or crash" : "");
+				skip_crashes ? " or crash" : "");
 
 		WARNF("Skipped %u test cases (%0.02f%%) due to timeouts%s.", cal_failures,
 			((double)cal_failures) * 100 / queued_paths,
@@ -3034,7 +3108,7 @@ static void pivot_inputs(void) {
 
 	while (q) {
 
-		u8  *nfn, *rsl = strrchr(q->fname, '\\');
+		u8* nfn, * rsl = strrchr(q->fname, '\\');
 		u32 orig_id;
 
 		if (!rsl) rsl = q->fname; else rsl++;
@@ -3143,8 +3217,8 @@ static u8* describe_op(u8 hnb) {
 
 			if (stage_val_type != STAGE_VAL_NONE)
 				sprintf(ret + strlen(ret), ",val_%s%+d",
-				(stage_val_type == STAGE_VAL_BE) ? "be_" : "",
-				stage_cur_val);
+					(stage_val_type == STAGE_VAL_BE) ? "be_" : "",
+					stage_cur_val);
 
 		}
 		else sprintf(ret + strlen(ret), ",rep_%u", stage_cur_val);
@@ -3213,7 +3287,7 @@ entry is saved, 0 otherwise. */
 
 static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
-	u8  *fn = "";
+	u8* fn = "";
 	u8  hnb = '\0';
 	s32 fd;
 	u8  keeping = 0, res;
@@ -3406,7 +3480,7 @@ static u32 find_start_position(void) {
 
 	static u8 tmp[4096]; /* Ought to be enough for anybody. */
 
-	u8  *fn, *off;
+	u8* fn, * off;
 	s32 fd, i;
 	u32 ret;
 
@@ -3441,7 +3515,7 @@ static void find_timeout(void) {
 
 	static u8 tmp[4096]; /* Ought to be enough for anybody. */
 
-	u8  *fn, *off;
+	u8* fn, * off;
 	s32 fd, i;
 	u32 ret;
 
@@ -3589,7 +3663,7 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
 files in a directory. */
 
 static u8 delete_files(u8* path, u8* prefix) {
-	char *pattern;
+	char* pattern;
 	WIN32_FIND_DATA fd;
 	HANDLE h;
 
@@ -3685,7 +3759,7 @@ is not currently running, and if the last run time isn't too great. */
 static void maybe_delete_out_dir(void) {
 
 	FILE* f;
-	u8 *fn = alloc_printf("%s\\fuzzer_stats", out_dir);
+	u8* fn = alloc_printf("%s\\fuzzer_stats", out_dir);
 
 	/* See if the output directory is locked. If yes, bail out. If not,
 	create a lock that will persist for the lifetime of the process
@@ -4097,12 +4171,12 @@ static void show_stats(void) {
 		if (dumb_mode)
 
 			SAYF(bV bSTOP "   last new path : " cPIN "n/a" cRST
-			" (non-instrumented mode)        ");
+				" (non-instrumented mode)        ");
 
 		else
 
 			SAYF(bV bSTOP "   last new path : " cRST "none yet " cLRD
-			"(odd, check syntax!)      ");
+				"(odd, check syntax!)      ");
 
 	}
 
@@ -4250,36 +4324,36 @@ static void show_stats(void) {
 
 	if (!skip_deterministic)
 		sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-		DI(stage_finds[STAGE_FLIP8]), DI(stage_cycles[STAGE_FLIP8]),
-		DI(stage_finds[STAGE_FLIP16]), DI(stage_cycles[STAGE_FLIP16]),
-		DI(stage_finds[STAGE_FLIP32]), DI(stage_cycles[STAGE_FLIP32]));
+			DI(stage_finds[STAGE_FLIP8]), DI(stage_cycles[STAGE_FLIP8]),
+			DI(stage_finds[STAGE_FLIP16]), DI(stage_cycles[STAGE_FLIP16]),
+			DI(stage_finds[STAGE_FLIP32]), DI(stage_cycles[STAGE_FLIP32]));
 
 	SAYF(bV bSTOP "  byte flips : " cRST "%-37s " bSTG bV bSTOP "   pending : "
 		cRST "%-10s " bSTG bV "\n", tmp, DI(pending_not_fuzzed));
 
 	if (!skip_deterministic)
 		sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-		DI(stage_finds[STAGE_ARITH8]), DI(stage_cycles[STAGE_ARITH8]),
-		DI(stage_finds[STAGE_ARITH16]), DI(stage_cycles[STAGE_ARITH16]),
-		DI(stage_finds[STAGE_ARITH32]), DI(stage_cycles[STAGE_ARITH32]));
+			DI(stage_finds[STAGE_ARITH8]), DI(stage_cycles[STAGE_ARITH8]),
+			DI(stage_finds[STAGE_ARITH16]), DI(stage_cycles[STAGE_ARITH16]),
+			DI(stage_finds[STAGE_ARITH32]), DI(stage_cycles[STAGE_ARITH32]));
 
 	SAYF(bV bSTOP " arithmetics : " cRST "%-37s " bSTG bV bSTOP "  pend fav : "
 		cRST "%-10s " bSTG bV "\n", tmp, DI(pending_favored));
 
 	if (!skip_deterministic)
 		sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-		DI(stage_finds[STAGE_INTEREST8]), DI(stage_cycles[STAGE_INTEREST8]),
-		DI(stage_finds[STAGE_INTEREST16]), DI(stage_cycles[STAGE_INTEREST16]),
-		DI(stage_finds[STAGE_INTEREST32]), DI(stage_cycles[STAGE_INTEREST32]));
+			DI(stage_finds[STAGE_INTEREST8]), DI(stage_cycles[STAGE_INTEREST8]),
+			DI(stage_finds[STAGE_INTEREST16]), DI(stage_cycles[STAGE_INTEREST16]),
+			DI(stage_finds[STAGE_INTEREST32]), DI(stage_cycles[STAGE_INTEREST32]));
 
 	SAYF(bV bSTOP "  known ints : " cRST "%-37s " bSTG bV bSTOP " own finds : "
 		cRST "%-10s " bSTG bV "\n", tmp, DI(queued_discovered));
 
 	if (!skip_deterministic)
 		sprintf(tmp, "%s/%s, %s/%s, %s/%s",
-		DI(stage_finds[STAGE_EXTRAS_UO]), DI(stage_cycles[STAGE_EXTRAS_UO]),
-		DI(stage_finds[STAGE_EXTRAS_UI]), DI(stage_cycles[STAGE_EXTRAS_UI]),
-		DI(stage_finds[STAGE_EXTRAS_AO]), DI(stage_cycles[STAGE_EXTRAS_AO]));
+			DI(stage_finds[STAGE_EXTRAS_UO]), DI(stage_cycles[STAGE_EXTRAS_UO]),
+			DI(stage_finds[STAGE_EXTRAS_UI]), DI(stage_cycles[STAGE_EXTRAS_UI]),
+			DI(stage_finds[STAGE_EXTRAS_AO]), DI(stage_cycles[STAGE_EXTRAS_AO]));
 
 	SAYF(bV bSTOP "  dictionary : " cRST "%-37s " bSTG bV bSTOP
 		"  imported : " cRST "%-10s " bSTG bV "\n", tmp,
@@ -4296,7 +4370,7 @@ static void show_stats(void) {
 
 	SAYF(" stability : %s%-10s " bSTG bV "\n", (stab_ratio < 85 && var_byte_count > 40)
 		? cLRD : ((queued_variable && (!persistent_mode || var_byte_count > 20))
-		? cMGN : cRST), tmp);
+			? cMGN : cRST), tmp);
 
 	if (!bytes_trim_out) {
 
@@ -4351,8 +4425,6 @@ static void show_stats(void) {
 
 		if (!no_cpu_meter_red && cur_utilization >= 90) cpu_color = cLRD;
 
-#ifdef HAVE_AFFINITY
-
 		if (cpu_aff >= 0) {
 
 			SAYF(SP10 cGRA "[cpu%03u:%s%3u%%" cGRA "]\r" cRST,
@@ -4366,13 +4438,6 @@ static void show_stats(void) {
 				cpu_color, MIN(cur_utilization, 999));
 
 		}
-
-#else
-
-		SAYF(SP10 cGRA "   [cpu:%s%3u%%" cGRA "]\r" cRST,
-			cpu_color, MIN(cur_utilization, 999));
-
-#endif /* ^HAVE_AFFINITY */
 
 	}
 	else SAYF("\r");
@@ -4416,7 +4481,7 @@ static void show_init_stats(void) {
 
 	if (avg_us > (qemu_mode ? 50000 : 10000))
 		WARNF(cLRD "The target binary is pretty slow! See %s\\perf_tips.txt.",
-		doc_path);
+			doc_path);
 
 	/* Let's keep things moving with slow binaries. */
 
@@ -4428,10 +4493,10 @@ static void show_init_stats(void) {
 
 		if (max_len > 50 * 1024)
 			WARNF(cLRD "Some test cases are huge (%s) - see %s\\perf_tips.txt!",
-			DMS(max_len), doc_path);
+				DMS(max_len), doc_path);
 		else if (max_len > 10 * 1024)
 			WARNF("Some test cases are big (%s) - see %s\\perf_tips.txt.",
-			DMS(max_len), doc_path);
+				DMS(max_len), doc_path);
 
 		if (useless_at_start && !in_bitmap)
 			WARNF(cLRD "Some test cases look useless. Consider using a smaller set.");
@@ -4733,13 +4798,14 @@ static u32 choose_block_len(u32 limit) {
 		max_value = HAVOC_BLK_MEDIUM;
 		break;
 
-	default: 
-		if (UR(10))	{
+	default:
+		if (UR(10)) {
 
 			min_value = HAVOC_BLK_MEDIUM;
 			max_value = HAVOC_BLK_LARGE;
 
-		} else {
+		}
+		else {
 
 			min_value = HAVOC_BLK_LARGE;
 			max_value = HAVOC_BLK_XL;
@@ -11201,7 +11267,7 @@ static void sync_fuzzers(char** argv) {
 
 	WIN32_FIND_DATA sd;
 	HANDLE h;
-	char *find_pattern;
+	char* find_pattern;
 
 	u32 sync_cnt = 0;
 
@@ -11222,7 +11288,7 @@ static void sync_fuzzers(char** argv) {
 
 		WIN32_FIND_DATA qd;
 		HANDLE h2;
-		u8 *qd_path, *qd_synced_path, *qd_path_pattern;
+		u8* qd_path, * qd_synced_path, * qd_path_pattern;
 		u32 min_accept = 0, next_min_accept;
 
 		s32 id_fd;
@@ -11347,70 +11413,71 @@ EXP_ST void check_binary(u8* fname) {
 
 /* Trim and possibly create a banner for the run. */
 
-static void fix_up_banner(u8* name) {
+static void fix_up_banner(std::vector<u8*> name) {
 
-	/*if (!use_banner) {
+	if (name.size() == 1) {
+		/*if (!use_banner) {
 
+			if (sync_id) {
+
+				use_banner = sync_id;
+
+			}
+			else {
+
+				u8* trim = strrchr(name, '\\');
+				if (!trim) use_banner = name; else use_banner = trim + 1;
+
+			}
+
+		}
+
+		if (strlen(use_banner) > 40) {
+
+			u8* tmp = (u8*)ck_alloc(44);
+			sprintf(tmp, "%.40s...", use_banner);
+			use_banner = tmp;
+
+		}*/
+
+		u8* type = NULL;
 		if (sync_id) {
 
-			use_banner = sync_id;
+			type = sync_id;
 
 		}
 		else {
 
-			u8* trim = strrchr(name, '\\');
-			if (!trim) use_banner = name; else use_banner = trim + 1;
+			u8* trim = strrchr(name[0], '\\');
+			if (!trim) type = name[0]; else type = trim + 1;
 
 		}
 
-	}
+		if (strlen(type) > 40) {
 
-	if (strlen(use_banner) > 40) {
+			u8* tmp = (u8*)ck_alloc(44);
+			sprintf(tmp, "%.40s...", type);
+			type = tmp;
 
-		u8* tmp = (u8*)ck_alloc(44);
-		sprintf(tmp, "%.40s...", use_banner);
-		use_banner = tmp;
-
-	}*/
-
-	u8* type = NULL;
-	if (sync_id) {
-
-		type = sync_id;
-
-	}
-	else {
-
-		u8* trim = strrchr(name, '\\');
-		if (!trim) type = name; else type = trim + 1;
-
-	}
-
-	if (strlen(type) > 40) {
-
-		u8* tmp = (u8*)ck_alloc(44);
-		sprintf(tmp, "%.40s...", type);
-		type = tmp;
-
-	}
-
-	if (!use_banner) {
-		use_banner = (u8*)ck_alloc(256);
-		u8* string_schedule;
-		switch (schedule) {
-		case EXPLORE: string_schedule = "explore"; break;
-		case EXPLOIT: string_schedule = "exploit"; break;
-		case FAST:    string_schedule = "fast"; break;
-		case COE:     string_schedule = "coe"; break;
-		case LIN:     string_schedule = "lin"; break;
-		case QUAD:    string_schedule = "quad"; break;
-		case RARE:    string_schedule = "rare"; break;
-		case MMOPT:   string_schedule = "mmopt"; break;
-		default: FATAL("Unkown power schedule"); break;
 		}
-		sprintf(use_banner, "%s (%s)", type, string_schedule);
-	}
 
+		if (!use_banner) {
+			use_banner = (u8*)ck_alloc(256);
+			u8* string_schedule;
+			switch (schedule) {
+			case EXPLORE: string_schedule = "explore"; break;
+			case EXPLOIT: string_schedule = "exploit"; break;
+			case FAST:    string_schedule = "fast"; break;
+			case COE:     string_schedule = "coe"; break;
+			case LIN:     string_schedule = "lin"; break;
+			case QUAD:    string_schedule = "quad"; break;
+			case RARE:    string_schedule = "rare"; break;
+			case MMOPT:   string_schedule = "mmopt"; break;
+			default: FATAL("Unkown power schedule"); break;
+			}
+			sprintf(use_banner, "%s (%s)", type, string_schedule);
+		}
+	}
 }
 
 
@@ -11448,7 +11515,7 @@ static void usage(u8* argv0) {
 		"  -f file       - location read by the fuzzed program (stdin)\n"
 		"  -t msec       - timeout for each run (auto-scaled, 50-%u ms)\n"
 		"  -Q            - use binary-only instrumentation (QEMU mode)\n\n"
-		
+
 		"Mutator settings:\n\n"
 		"  -L minutes    - use MOpt(imize) mode and set the time limit for "
 		"entering the\n"
@@ -11480,6 +11547,26 @@ static void usage(u8* argv0) {
 	exit(1);
 
 }
+
+/* Put all target to env*/
+
+EXP_ST void setup_env_target(std::vector<char*> module)
+{
+	u8* tmp;
+	tmp = (u8*)malloc(1024);
+	memset(tmp, 0, 1024);
+
+	for (int i = 0; i < module.size(); i++) {
+		sprintf(tmp + strlen(tmp), "%s ", module[i]);
+	}
+	tmp[strlen(tmp) - 1] = 0;
+	_putenv_s(TARGET_VAR, tmp);
+
+	if (tmp) {
+		free(tmp);
+	}
+}
+
 
 
 /* Prepare output directories and fds. */
@@ -11741,31 +11828,30 @@ static void check_cpu_governor(void) {
 
 static void get_core_count(void) {
 
-	double cur_runnable = 0;
+	u32 cur_runnable = 0;
 
-	cpu_core_count = atoi(getenv("NUMBER_OF_PROCESSORS"));
+	SYSTEM_INFO sys_info = { 0 };
+	GetSystemInfo(&sys_info);
+	cpu_core_count = sys_info.dwNumberOfProcessors;
 
 	if (cpu_core_count > 0) {
+		cur_runnable = (u32)get_runnable_processes();
 
-		/* initialize PDH */
-
-		PdhOpenQuery(NULL, NULL, &cpuQuery);
-		PdhAddCounter(cpuQuery, TEXT("\\Processor(_Total)\\% Processor Time"), NULL, &cpuTotal);
-		PdhCollectQueryData(cpuQuery);
-
-		cur_runnable = get_runnable_processes();
-
-		OKF("You have %u CPU cores and utilization %0.0f%%.",
-			cpu_core_count, cur_runnable);
+		OKF("You have %u CPU cores and %u runnable tasks (utilization: %0.0f%%).",
+			cpu_core_count, cur_runnable, cur_runnable * 100.0 / cpu_core_count);
 
 		if (cpu_core_count > 1) {
 
-			if (cur_runnable >= 90.0) {
+			if (cur_runnable > cpu_core_count * 1.5) {
 
 				WARNF("System under apparent load, performance may be spotty.");
 
 			}
+			else if (cur_runnable + 1 <= cpu_core_count) {
 
+				OKF("Try parallel jobs - see %s\\parallel_fuzzing.txt.", doc_path);
+
+			}
 		}
 
 	}
@@ -11849,7 +11935,7 @@ static void check_asan_opts(void) {
 
 		if (!strstr(x, "exit_code=" STRINGIFY(MSAN_ERROR)))
 			FATAL("Custom MSAN_OPTIONS set without exit_code="
-			STRINGIFY(MSAN_ERROR) " - please fix!");
+				STRINGIFY(MSAN_ERROR) " - please fix!");
 
 		if (!strstr(x, "symbolize=0"))
 			FATAL("Custom MSAN_OPTIONS set without symbolize=0 - please fix!");
@@ -11874,7 +11960,7 @@ EXP_ST void detect_file_args(char** argv) {
 
 		if (aa_loc) {
 
-			u8 *aa_subst, *n_arg;
+			u8* aa_subst, * n_arg;
 
 			/* If we don't have a file name chosen yet, use a safe default. */
 
@@ -11948,10 +12034,10 @@ static void save_cmdline(u32 argc, char** argv) {
 }
 
 static u32 optind;
-static char *optarg;
+static char* optarg;
 
-int getopt(int argc, char **argv, char *optstring) {
-	char *c;
+int getopt(int argc, char** argv, char* optstring) {
+	char* c;
 
 	optarg = NULL;
 
@@ -11988,7 +12074,7 @@ int main(int argc, char** argv) {
 	s32 opt;
 	u64 prev_queued = 0;
 	u32 sync_interval_cnt = 0, seek_to;
-	u8  *extras_dir = 0;
+	u8* extras_dir = 0;
 	u8  mem_limit_given = 0;
 	u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
 	char** use_argv;
@@ -12027,9 +12113,8 @@ int main(int argc, char** argv) {
 
 		case 'p': /* instrumented PE path */
 
-			if (target_module) FATAL("TODO: Multiple PE support");
-			target_module = optarg;
-			_putenv_s(TARGET_VAR, target_module);
+			//if (target_module) FATAL("TODO: Multiple PE support");
+			target_module.push_back(optarg);
 			break;
 
 		case 'M': { /* master sync ID */
@@ -12053,7 +12138,7 @@ int main(int argc, char** argv) {
 
 		}
 
-				  break;
+				break;
 
 		case 'S':
 
@@ -12123,7 +12208,7 @@ int main(int argc, char** argv) {
 
 		}
 
-				  break;
+				break;
 
 		case 'd': /* skip deterministic */
 
@@ -12355,9 +12440,13 @@ int main(int argc, char** argv) {
 
 			usage(argv[0]);
 
-	}
+		}
 
-	if (optind == argc || !in_dir || !out_dir || !target_module) usage(argv[0]);
+	if (optind == argc || !in_dir || !out_dir || !target_module.size()) usage(argv[0]);
+
+
+	// push target to env
+	setup_env_target(target_module);
 
 	setup_signal_handlers();
 	check_asan_opts();
@@ -12411,9 +12500,7 @@ int main(int argc, char** argv) {
 
 	get_core_count();
 
-#ifdef HAVE_AFFINITY
 	bind_to_free_cpu();
-#endif /* HAVE_AFFINITY */
 
 	check_crash_handling();
 	check_cpu_governor();
