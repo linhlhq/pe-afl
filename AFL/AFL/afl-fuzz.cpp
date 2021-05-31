@@ -522,7 +522,7 @@ static void shuffle_ptrs(void** ptrs, u32 cnt) {
 static u64 get_process_affinity(u32 process_id) {
 
 	/* if we can't get process affinity we treat it as if he doesn't have affinity */
-	u64 affinity = 0;
+	u64 affinity = 0ULL;
 	DWORD_PTR process_affinity_mask = 0;
 	DWORD_PTR system_affinity_mask = 0;
 
@@ -3706,11 +3706,54 @@ static u8 delete_files(u8* path, u8* prefix) {
 /* Get the number of runnable processes, with some simple smoothing. */
 
 static double get_runnable_processes(void) {
-	PDH_FMT_COUNTERVALUE counterVal;
 
-	PdhCollectQueryData(cpuQuery);
-	PdhGetFormattedCounterValue(cpuTotal, PDH_FMT_DOUBLE, NULL, &counterVal);
-	return counterVal.doubleValue;
+	static double res;
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
+
+	/* I don't see any portable sysctl or so that would quickly give us the
+	   number of runnable processes; the 1-minute load average can be a
+	   semi-decent approximation, though. */
+
+	if (getloadavg(&res, 1) != 1) return 0;
+
+#else
+
+	/* On Linux, /proc/stat is probably the best way; load averages are
+	   computed in funny ways and sometimes don't reflect extremely short-lived
+	   processes well. */
+
+	FILE* f = fopen("\\proc\\stat", "r");
+	u8 tmp[1024];
+	u32 val = 0;
+
+	if (!f) return 0;
+
+	while (fgets(tmp, sizeof(tmp), f)) {
+
+		if (!strncmp(tmp, "procs_running ", 14) ||
+			!strncmp(tmp, "procs_blocked ", 14)) val += atoi(tmp + 14);
+
+	}
+
+	fclose(f);
+
+	if (!res) {
+
+		res = val;
+
+	}
+	else {
+
+		res = res * (1.0 - 1.0 / AVG_SMOOTHING) +
+			((double)val) * (1.0 / AVG_SMOOTHING);
+
+	}
+
+#endif /* ^(__APPLE__ || __FreeBSD__ || __OpenBSD__) */
+
+	return res;
+
 }
 
 
@@ -4412,32 +4455,22 @@ static void show_stats(void) {
 
 	if (cpu_core_count) {
 
-		u32 cur_utilization = (u32)get_runnable_processes();
+		double cur_runnable = get_runnable_processes();
+		u32 cur_utilization = cur_runnable * 100 / cpu_core_count;
 
 		u8* cpu_color = cCYA;
 
 		/* If we could still run one or more processes, use green. */
 
-		if (cpu_core_count > 1 && cur_utilization < 90)
+		if (cpu_core_count > 1 && cur_runnable + 1 <= cpu_core_count)
 			cpu_color = cLGN;
 
 		/* If we're clearly oversubscribed, use red. */
 
-		if (!no_cpu_meter_red && cur_utilization >= 90) cpu_color = cLRD;
+		if (!no_cpu_meter_red && cur_utilization >= 150) cpu_color = cLRD;
 
-		if (cpu_aff >= 0) {
-
-			SAYF(SP10 cGRA "[cpu%03u:%s%3u%%" cGRA "]\r" cRST,
-				MIN(cpu_aff, 999), cpu_color,
-				MIN(cur_utilization, 999));
-
-		}
-		else {
-
-			SAYF(SP10 cGRA "   [cpu:%s%3u%%" cGRA "]\r" cRST,
-				cpu_color, MIN(cur_utilization, 999));
-
-		}
+		SAYF(SP10 cGRA "   [cpu:%s%3u%%" cGRA "]\r" cRST,
+			cpu_color, cur_utilization < 999 ? cur_utilization : 999);
 
 	}
 	else SAYF("\r");
@@ -11830,12 +11863,46 @@ static void get_core_count(void) {
 
 	u32 cur_runnable = 0;
 
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
+
+	size_t s = sizeof(cpu_core_count);
+
+	/* On *BSD systems, we can just use a sysctl to get the number of CPUs. */
+
+#ifdef __APPLE__
+
+	if (sysctlbyname("hw.logicalcpu", &cpu_core_count, &s, NULL, 0) < 0)
+		return;
+
+#else
+
+	int s_name[2] = { CTL_HW, HW_NCPU };
+
+	if (sysctl(s_name, 2, &cpu_core_count, &s, NULL, 0) < 0) return;
+
+#endif /* ^__APPLE__ */
+
+#else
+	/* On Linux, a simple way is to look at /proc/stat, especially since we'd
+	   be parsing it anyway for other reasons later on. */
+
 	SYSTEM_INFO sys_info = { 0 };
 	GetSystemInfo(&sys_info);
 	cpu_core_count = sys_info.dwNumberOfProcessors;
 
-	if (cpu_core_count > 0) {
+#endif /* ^(__APPLE__ || __FreeBSD__ || __OpenBSD__) */
+
+	if (cpu_core_count) {
+
 		cur_runnable = (u32)get_runnable_processes();
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
+
+		/* Add ourselves, since the 1-minute average doesn't include that yet. */
+
+		cur_runnable++;
+
+#endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
 		OKF("You have %u CPU cores and %u runnable tasks (utilization: %0.0f%%).",
 			cpu_core_count, cur_runnable, cur_runnable * 100.0 / cpu_core_count);
@@ -11852,15 +11919,12 @@ static void get_core_count(void) {
 				OKF("Try parallel jobs - see %s\\parallel_fuzzing.txt.", doc_path);
 
 			}
+
 		}
 
 	}
-	else {
+	else WARNF("Unable to figure out the number of CPU cores.");
 
-		cpu_core_count = 0;
-		WARNF("Unable to figure out the number of CPU cores.");
-
-	}
 
 }
 
